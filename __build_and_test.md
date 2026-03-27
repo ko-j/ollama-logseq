@@ -1,0 +1,1 @@
+pnpm build && cp -r dist package.json icon.png logo.svg ~/.logseq/plugins/ollama-logseq/

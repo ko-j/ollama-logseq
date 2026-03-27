@@ -430,8 +430,8 @@ export async function describeImageFromEvent(b: IHookEvent) {
     // Use any non-image text in the block as additional context, otherwise use default prompt
     const textContent = stripImageSyntax(blockContent).trim();
     const prompt = textContent.length > 0
-      ? `Describe this image. Additional context: ${textContent}`
-      : "Describe this image in detail.";
+      ? `Describe this image. Use markdown if necessary. You can also create tags with [[word]]. It is very important that every title/subtitle and paragraph starts with a dash "-" and is indented under a title or parent list item! Never do double dashes "- - " It breaks the formatting. Additional context: ${textContent}`
+      : "Describe this image. Use markdown if necessary. You can also create tags with [[word]]. It is very important that every title/subtitle and paragraph starts with a dash \"-\" and is indented under a title or parent list item! Never do double dashes \"- - \" It breaks the formatting.";
 
     const result = await ollamaGenerate(prompt, params, images);
     await logseq.Editor.updateBlock(answerBlock!.uuid, `${result.response}`)
