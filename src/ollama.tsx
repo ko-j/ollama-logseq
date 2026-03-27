@@ -3,6 +3,142 @@ import { BlockEntity, BlockUUIDTuple } from "@logseq/libs/dist/LSPlugin.user";
 
 const delay = (t = 100) => new Promise(r => setTimeout(r, t))
 
+// --- Image handling utilities ---
+
+// Logseq may insert newlines in image markdown, e.g.:
+//   !
+//   [image.png]
+//   (../assets/image_123.png)
+// So we use [\s\S] with the 's' flag to match across line breaks.
+const IMAGE_REGEX = /!\s*\[.*?\]\s*\(\s*(.*?)\s*\)/gs;
+
+/**
+ * Extract image paths from markdown block content.
+ * Matches patterns like ![alt](../assets/image_123.png)
+ * and Logseq's multiline variant with newlines between parts.
+ */
+function extractImagePaths(content: string): string[] {
+  const paths: string[] = [];
+  let match;
+  const regex = new RegExp(IMAGE_REGEX.source, IMAGE_REGEX.flags);
+  while ((match = regex.exec(content)) !== null) {
+    const path = match[1].trim();
+    if (path.length > 0) {
+      paths.push(path);
+    }
+  }
+  return paths;
+}
+
+/**
+ * Resolve a relative image path (e.g. ../assets/image.png) to an absolute
+ * filesystem path using the current Logseq graph path.
+ *
+ * Logseq block content references images as ../assets/filename relative to
+ * the pages/ directory, so the absolute path is {graphPath}/assets/{filename}.
+ * Also handles already-absolute paths and http(s) URLs.
+ */
+async function resolveImagePath(relativePath: string): Promise<string> {
+  // If it's a URL, return as-is
+  if (relativePath.startsWith('http://') || relativePath.startsWith('https://')) {
+    return relativePath;
+  }
+
+  // If it's already absolute, return as-is
+  if (relativePath.startsWith('/') || /^[A-Z]:\\/i.test(relativePath)) {
+    return relativePath;
+  }
+
+  const graph = await logseq.App.getCurrentGraph();
+  if (!graph) {
+    throw new Error("Could not determine current graph path");
+  }
+
+  // ../assets/filename.png → assets/filename.png
+  // The relative path is from pages/ dir, so strip leading ../
+  const normalized = relativePath.replace(/^\.\.\//, '');
+  const graphPath = graph.path.replace(/\/$/, '');
+  return `${graphPath}/${normalized}`;
+}
+
+/**
+ * Read an image file and return its base64 encoding (without data URI prefix).
+ * Uses an Image element + Canvas to load and encode the image.
+ * Local files are loaded via Logseq's assets:// protocol which is available
+ * in the Electron environment.
+ */
+async function imageToBase64(imagePath: string): Promise<string> {
+  let url: string;
+  if (imagePath.startsWith('http://') || imagePath.startsWith('https://')) {
+    url = imagePath;
+  } else {
+    // Use Logseq's assets:// protocol for local files
+    const absolutePath = imagePath.startsWith('/') ? imagePath : `/${imagePath}`;
+    url = `assets://${absolutePath}`;
+  }
+
+  return new Promise<string>((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = 'anonymous';
+    img.onload = () => {
+      try {
+        const canvas = document.createElement('canvas');
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        const ctx = canvas.getContext('2d');
+        if (!ctx) {
+          reject(new Error('Could not get canvas context'));
+          return;
+        }
+        ctx.drawImage(img, 0, 0);
+        const dataUrl = canvas.toDataURL('image/png');
+        // Strip the "data:image/png;base64," prefix
+        const base64 = dataUrl.split(',')[1];
+        resolve(base64);
+      } catch (e) {
+        reject(e);
+      }
+    };
+    img.onerror = (e) => {
+      reject(new Error(`Failed to load image: ${url} - ${e}`));
+    };
+    img.src = url;
+  });
+}
+
+/**
+ * Extract images from block content, resolve their paths, and convert to
+ * base64 strings suitable for the Ollama API `images` field.
+ * Returns an array of base64-encoded image strings.
+ */
+async function extractAndEncodeImages(content: string): Promise<string[]> {
+  const imagePaths = extractImagePaths(content);
+  if (imagePaths.length === 0) {
+    return [];
+  }
+
+  const base64Images: string[] = [];
+  for (const relPath of imagePaths) {
+    try {
+      const absolutePath = await resolveImagePath(relPath);
+      console.log("ollama-logseq: resolved image path:", relPath, "->", absolutePath);
+      const base64 = await imageToBase64(absolutePath);
+      base64Images.push(base64);
+    } catch (e) {
+      console.error(`ollama-logseq: Failed to encode image ${relPath}:`, e);
+      logseq.UI.showMsg(`Failed to load image: ${relPath}\n${e}`, 'warning');
+    }
+  }
+  return base64Images;
+}
+
+/**
+ * Remove image markdown syntax from content to produce a clean text prompt.
+ */
+function stripImageSyntax(content: string): string {
+  return content.replace(/!\s*\[.*?\]\s*\(\s*.*?\s*\)/gs, '').trim();
+}
+
 
 export async function ollamaUI() {
   logseq.showMainUI()
@@ -72,7 +208,7 @@ type OllamaGenerateParameters = {
   [key: string]: any;
 }
 
-async function ollamaGenerate(prompt: string, parameters?: OllamaGenerateParameters) {
+async function ollamaGenerate(prompt: string, parameters?: OllamaGenerateParameters, images?: string[]) {
   if (!logseq.settings) {
     throw new Error("Couldn't find ollama-logseq settings")
   }
@@ -83,6 +219,9 @@ async function ollamaGenerate(prompt: string, parameters?: OllamaGenerateParamet
   }
   params.prompt = prompt
   params.stream = false
+  if (images && images.length > 0) {
+    params.images = images;
+  }
 
   try {
     const response = await fetch(`http://${logseq.settings.host}/api/generate`, {
@@ -227,14 +366,21 @@ async function promptFromBlock(block: BlockEntity, prefix?: string) {
   const params = await getOllamaParametersFromBlockAndParentProperties(block!)
   const blockContent = await getTreeContent(block);
 
-  // let prompt = block!.content.replace(/^.*::.*$/gm, '') // hack to remove properties from block content
+  // Extract images from block content and encode as base64
+  const images = await extractAndEncodeImages(blockContent);
 
-  let prompt = blockContent;
+  // Strip image syntax from the prompt text so the LLM gets clean text
+  let prompt = images.length > 0 ? stripImageSyntax(blockContent) : blockContent;
   if (prefix) {
     prompt = prefix + "\n" + prompt
   }
 
-  const result = await ollamaGenerate(prompt, params);
+  // If the block only contained an image and no text, provide a default prompt
+  if (images.length > 0 && prompt.trim().length === 0) {
+    prompt = prefix || "Describe this image in detail.";
+  }
+
+  const result = await ollamaGenerate(prompt, params, images);
 
   //FIXME: work out the best way to story context
   if (params.usecontext) {
@@ -253,6 +399,45 @@ export function promptFromBlockEventClosure(prefix?: string) {
       logseq.UI.showMsg(e.toString(), 'warning')
       console.error(e)
     }
+  }
+}
+
+/**
+ * Describe images found in a block. Extracts all images from the block content,
+ * sends them to Ollama with a description prompt, and inserts the response
+ * as a child block.
+ */
+export async function describeImageFromEvent(b: IHookEvent) {
+  try {
+    const block = await logseq.Editor.getBlock(b.uuid)
+    if (!block) {
+      throw new Error("Block not found")
+    }
+
+    const blockContent = block.content;
+    console.log("ollama-logseq: block content:", JSON.stringify(blockContent));
+    console.log("ollama-logseq: extracted image paths:", extractImagePaths(blockContent));
+    const images = await extractAndEncodeImages(blockContent);
+
+    if (images.length === 0) {
+      logseq.UI.showMsg(`No images found in this block. Content: ${blockContent.substring(0, 200)}`, 'warning')
+      return;
+    }
+
+    const answerBlock = await logseq.Editor.insertBlock(block.uuid, '🦙Describing image...', { before: false })
+    const params = await getOllamaParametersFromBlockAndParentProperties(block)
+
+    // Use any non-image text in the block as additional context, otherwise use default prompt
+    const textContent = stripImageSyntax(blockContent).trim();
+    const prompt = textContent.length > 0
+      ? `Describe this image. Additional context: ${textContent}`
+      : "Describe this image in detail.";
+
+    const result = await ollamaGenerate(prompt, params, images);
+    await logseq.Editor.updateBlock(answerBlock!.uuid, `${result.response}`)
+  } catch (e: any) {
+    logseq.UI.showMsg(e.toString(), 'warning')
+    console.error(e)
   }
 }
 

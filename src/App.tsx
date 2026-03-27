@@ -4,7 +4,8 @@ import {
   convertToFlashCardFromEvent,
   DivideTaskIntoSubTasksFromEvent,
   ollamaUI,
-  promptFromBlockEventClosure
+  promptFromBlockEventClosure,
+  describeImageFromEvent
 } from "./ollama";
 import { useAppVisible } from "./utils";
 
@@ -67,6 +68,7 @@ function App() {
     logseq.Editor.registerBlockContextMenuItem("Ollama: Custom prompt on Block", promptFromBlockEventClosure(logseq.settings.custom_prompt_block))
     logseq.Editor.registerBlockContextMenuItem("Ollama: Summarize block", promptFromBlockEventClosure("Summarize: "))
     logseq.Editor.registerBlockContextMenuItem("Ollama: Expand Block", promptFromBlockEventClosure("Expand: "))
+    logseq.Editor.registerBlockContextMenuItem("Ollama: Describe Image", describeImageFromEvent)
 
     logseq.App.registerCommandShortcut(
       { "binding": logseq.settings.shortcut },
